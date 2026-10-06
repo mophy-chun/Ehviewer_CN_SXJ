@@ -1,0 +1,83 @@
+name: Sync Releases from Upstream
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # 每天北京时间 08:00 运行一次
+  workflow_dispatch:      # 允许手动运行
+
+permissions:
+  contents: write
+
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync releases
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          UPSTREAM_REPO: xiaojieonly/Ehviewer_CN_SXJ
+        run: |
+          # 1. 获取上游所有 release 的 JSON 信息
+          gh release list --repo "$UPSTREAM_REPO" --json tagName,name,body,isPrerelease,isDraft --limit 1000 | jq -r '.[] | @base64' > release_list.b64
+          
+          echo "开始同步 Releases..."
+          count=0
+          
+          # 2. 逐个处理
+          while IFS= read -r row; do
+            [ -z "$row" ] && continue
+            
+            TAG=$(echo "$row" | base64 -d | jq -r '.tagName')
+            NAME=$(echo "$row" | base64 -d | jq -r '.name // empty')
+            BODY=$(echo "$row" | base64 -d | jq -r '.body // empty')
+            DRAFT=$(echo "$row" | base64 -d | jq -r '.isDraft')
+            PRERELEASE=$(echo "$row" | base64 -d | jq -r '.isPrerelease')
+
+            # 跳过草稿版本
+            if [ "$DRAFT" = "true" ]; then
+              echo "跳过草稿版本: $TAG"
+              continue
+            fi
+            
+            count=$((count + 1))
+            echo "正在处理第 $count 个: $TAG"
+
+            # 下载上游的所有附件到临时目录
+            DIR=$(mktemp -d)
+            gh release download "$TAG" --repo "$UPSTREAM_REPO" --dir "$DIR" 2>/dev/null || true
+
+            # 检查你的 fork 是否已经有这个 release
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              # 如果存在，只上传附件（使用 --clobber 强制覆盖/补充）
+              FILES=("$DIR"/*)
+              if [ -f "${FILES[0]}" ]; then
+                echo "  Release 已存在，正在补充附件..."
+                gh release upload "$TAG" "${FILES[@]}" --clobber 2>/dev/null || true
+              fi
+            else
+              # 如果不存在，创建新 release
+              ARGS=()
+              [ -n "$NAME" ] && ARGS+=("--title=$NAME")
+              [ -n "$BODY" ] && ARGS+=("--notes=$BODY")
+              [ "$PRERELEASE" = "true" ] && ARGS+=(--prerelease)
+              
+              FILES=("$DIR"/*)
+              if [ -f "${FILES[0]}" ]; then
+                echo "  创建新 Release 并上传附件..."
+                gh release create "$TAG" "${FILES[@]}" "${ARGS[@]}" 2>/dev/null || true
+              else
+                echo "  创建新 Release (无附件)..."
+                gh release create "$TAG" "${ARGS[@]}" 2>/dev/null || true
+              fi
+            fi
+            
+            # 清理临时目录
+            rm -rf "$DIR"
+            
+          done < release_list.b64
+
+          echo "全部处理完毕！"
